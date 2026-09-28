@@ -60,3 +60,10 @@ build-log.txt
 
 .DS_Store
 Thumbs.db
+
+# Personal build notes. These reference local absolute paths, the signing setup
+# and a third-party Apple account, so they stay on this machine rather than in the
+# public repository.
+GETTING-STARTED.md
+CI-SETUP.md
+LOCAL-BUILDS.md
