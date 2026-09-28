@@ -1,0 +1,188 @@
+name: iOS
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      versionName:
+        description: 'Marketing version, e.g. 1.0.1'
+        required: true
+        default: '1.0.1'
+      upload:
+        description: 'Upload to TestFlight'
+        type: boolean
+        required: false
+        default: true
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  testflight:
+    name: Archive and upload to TestFlight
+    # macos-15 matches the Xcode 16 on this image. Bump this only together with a
+    # deliberate SDK check; a mismatch here is the usual cause of "iOS SDK not found".
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    env:
+      # Derived from app.json in a later step, but needed early for clarity.
+      APP_BUNDLE_ID: com.worktracker.app
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up CocoaPods
+        run: |
+          set -euo pipefail
+          sudo gem install cocoapods --no-document
+          pod --version
+
+      - name: Install dependencies
+        run: npm ci
+
+      # ios/ is gitignored, so the Xcode project is generated fresh every run.
+      # --clean guarantees the signing settings are never inherited from a
+      # previous build, which is the most common cause of a stale-team error.
+      - name: Generate the iOS project
+        run: npx expo prebuild --platform ios --clean
+
+      - name: Install pods
+        run: npx pod-install ios
+
+      - name: Resolve project names
+        id: names
+        run: |
+          set -euo pipefail
+          SCHEME=$(node -p "require('./app.json').expo.name.replace(/[^A-Za-z0-9]/g,'')")
+          test -d "ios/$SCHEME.xcworkspace" || { echo "::error::ios/$SCHEME.xcworkspace not generated"; exit 1; }
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+          echo "Found workspace ios/$SCHEME.xcworkspace"
+
+      # A distribution certificate is a one-time export from the Apple Developer
+      # portal. It goes into a throwaway keychain, and the keychain is deleted
+      # again below so nothing survives on the runner.
+      - name: Import the distribution certificate
+        env:
+          CERT_P12_BASE64: ${{ secrets.APPLE_DISTRIBUTION_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_DISTRIBUTION_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN=build-ci.keychain
+          echo "$CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+
+          security create-keychain -p ci "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security unlock-keychain -p ci "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign -A
+
+          # Without this, codesign cannot see the imported key and the archive
+          # fails with "no matching key found" even though the import succeeded.
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          security find-identity -v -p codesigning
+
+      - name: Archive
+        env:
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          PROFILE_NAME: ${{ secrets.APPLE_PROVISIONING_PROFILE_NAME }}
+          CERT_NAME: ${{ secrets.APPLE_DISTRIBUTION_CERT_NAME }}
+        run: |
+          set -euo pipefail
+          SCHEME="${{ steps.names.outputs.scheme }}"
+          # CURRENT_PROJECT_VERSION is CFBundleVersion. TestFlight rejects a
+          # build number it has already seen, so this is tied to the run number
+          # rather than a fixed value in app.json.
+          xcodebuild \
+            -workspace "ios/$SCHEME.xcworkspace" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -archivePath "build/$SCHEME.xcarchive" \
+            -destination 'generic/platform=iOS' \
+            -allowProvisioningUpdates \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_STYLE=Manual \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+            CODE_SIGN_IDENTITY="$CERT_NAME" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
+            MARKETING_VERSION="${{ inputs.versionName || '1.0.0' }}" \
+            build
+
+      - name: Export the .ipa
+        env:
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          PROFILE_NAME: ${{ secrets.APPLE_PROVISIONING_PROFILE_NAME }}
+          SCHEME: ${{ steps.names.outputs.scheme }}
+        run: |
+          set -euo pipefail
+          cat > ExportOptions.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>teamID</key>
+            <string>$TEAM_ID</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>$APP_BUNDLE_ID</key>
+              <string>$PROFILE_NAME</string>
+            </dict>
+            <key>uploadSymbols</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath "build/$SCHEME.xcarchive" \
+            -exportOptionsPlist ExportOptions.plist \
+            -exportPath build/ipa
+          ls -la build/ipa
+
+      - name: Remove the signing keychain
+        if: always()
+        run: security delete-keychain build-ci.keychain || true
+
+      - name: Upload to TestFlight
+        if: inputs.upload != false
+        env:
+          KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          KEY_P8: ${{ secrets.APP_STORE_CONNECT_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          # altool looks for the key in this well-known location, so it is placed
+          # there rather than passed on the command line.
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          printf '%s' "$KEY_P8" > "$HOME/.appstoreconnect/private_keys/AuthKey_$KEY_ID.p8"
+          IPA=$(ls build/ipa/*.ipa | head -n1)
+          echo "Uploading $(basename "$IPA")"
+          xcrun altool --upload-app \
+            --file "$IPA" \
+            --type ios \
+            --apiKey "$KEY_ID" \
+            --apiIssuer "$ISSUER_ID"
+
+      - name: Upload the .ipa as a build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: work-tracker-ipa
+          path: build/ipa/*.ipa
+          retention-days: 30

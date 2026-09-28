@@ -1,0 +1,21 @@
+# Normalise line endings in the repository, and check out what each platform
+# needs. Without this, Windows commits CRLF into shell scripts, and a CRLF line
+# in a Gradle or CocoaPods script fails on the Linux and macOS runners with an
+# error that looks nothing like a line-ending problem.
+* text=auto eol=lf
+
+# Windows entry points genuinely need CRLF to be executable.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+gradlew text eol=lf
+
+# Never touched by the text filters.
+*.png binary
+*.jpg binary
+*.ico binary
+*.jks binary
+*.keystore binary
+*.p8 binary
+*.p12 binary
+*.mobilepprovision binary
