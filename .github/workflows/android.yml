@@ -77,6 +77,11 @@ jobs:
         run: |
           set -euo pipefail
           cd android
+          # The repository was authored on Windows, which does not carry the
+          # executable bit, so gradlew lands on the runner as 644 and cannot be
+          # invoked directly. Fixing it here rather than in the index keeps the
+          # commit reproducible from either platform.
+          chmod +x gradlew
           ./gradlew assembleRelease \
             -PreactNativeArchitectures=arm64-v8a \
             -PappVersionCode="${{ github.run_number }}" \
