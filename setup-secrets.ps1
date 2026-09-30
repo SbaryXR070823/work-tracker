@@ -67,9 +67,12 @@ function Set-GhSecret {
     return
   }
   if ($FromFile) {
-    # --file sends the file's bytes, which is the only safe way to pass a
-    # multi-line private key through PowerShell.
-    gh secret set $Name --file $FromFile --repo $Repo 2>&1 | Out-Null
+    # gh secret set has no --file flag in any version. Its documented way to
+    # read from a file is a stdin redirect, and a PowerShell pipe is not a
+    # redirect: piping Get-Content -Raw into a native command was measured to
+    # deliver different bytes than the file holds. For a PEM private key that
+    # matters, so cmd does the redirection instead, which is byte for byte.
+    cmd /c "gh secret set $Name --repo $Repo < `"$FromFile`"" 2>&1 | Out-Null
   } elseif ($Value) {
     # --body is required here. Without it gh reads from stdin and blocks.
     gh secret set $Name --body $Value --repo $Repo 2>&1 | Out-Null
