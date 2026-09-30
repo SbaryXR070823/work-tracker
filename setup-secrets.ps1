@@ -70,9 +70,15 @@ function Set-GhSecret {
     # --file sends the file's bytes, which is the only safe way to pass a
     # multi-line private key through PowerShell.
     gh secret set $Name --file $FromFile --repo $Repo 2>&1 | Out-Null
-  } else {
+  } elseif ($Value) {
     # --body is required here. Without it gh reads from stdin and blocks.
     gh secret set $Name --body $Value --repo $Repo 2>&1 | Out-Null
+  } else {
+    # PowerShell drops an empty string argument, so '--body $Value' arrives at
+    # gh as two arguments and it fails with 'accepts at most 1 arg(s)'. An
+    # empty secret is legitimate here, because a pkcs12 can be exported without
+    # a password, so the value is piped instead.
+    '' | gh secret set $Name --repo $Repo 2>&1 | Out-Null
   }
   if ($LASTEXITCODE -ne 0) { Write-Fail "gh secret set $Name returned $LASTEXITCODE" }
   Write-Step $Name
