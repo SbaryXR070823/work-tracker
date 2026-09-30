@@ -448,7 +448,19 @@ jobs:
             CODE_SIGN_IDENTITY="$CERT_NAME" \
             CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
             MARKETING_VERSION="${{ inputs.versionName || '1.0.0' }}" \
-            build
+            archive
+
+          # The action above must be 'archive', not 'build'. With 'build', xcodebuild
+          # accepts -archivePath and then ignores it, prints BUILD SUCCEEDED, and
+          # writes no .xcarchive at all. That cost a full run: the failure surfaced
+          # three minutes later in the export step as 'archive not found at path',
+          # which points at the export step and not at the one that went wrong.
+          if [ ! -d "build/$SCHEME.xcarchive" ]; then
+            echo "::error::the archive step succeeded but build/$SCHEME.xcarchive does not exist"
+            echo "::error::if the xcodebuild action is 'build' rather than 'archive', -archivePath is ignored"
+            exit 1
+          fi
+          echo "archive written to build/$SCHEME.xcarchive"
 
       - name: Export the .ipa
         env:
