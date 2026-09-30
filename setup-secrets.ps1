@@ -159,34 +159,54 @@ if ($Platform -in 'ios', 'both') {
   $p12 = (Resolve-Path $p12).Path
   Write-Step "$(Split-Path $p12 -Leaf)  $([math]::Round((Get-Item $p12).Length/1KB,1)) KB"
 
-  $pw12 = Read-Secret '  password for that .p12'
+  $pw12 = Read-Secret '  password for that .p12 (press Enter if it has none)'
+  Write-Host ''
 
   # --- read the certificate to get the team id and the cert name ------------
-  $keytool = Get-Keytool
-  if (-not $keytool) {
-    Write-Fail 'keytool not found. Install a JDK, or fill in the team id and cert name by hand.'
+  # A pkcs12 with an empty password cannot be read on Windows at all: keytool
+  # refuses to display a certificate it cannot integrity-check, and openssl
+  # reports "Mac verify error". Neither can rewrite it with a real password.
+  # In that case the two names are asked for instead. The build itself runs on
+  # macOS, where security import can still handle an empty password.
+  $owner = $null
+  if ($pw12) {
+    $keytool = Get-Keytool
+    if ($keytool) {
+      $listing = (& $keytool -list -v -keystore $p12 -storetype PKCS12 -storepass $pw12 2>&1) -join "`n"
+      if ($listing -notmatch 'Owner:') {
+        Write-Fail 'that password did not open the .p12'
+      }
+      $owner = ([regex]::Match($listing, '(?m)^\s*Owner:\s*(.+)$')).Groups[1].Value.Trim()
+      Write-Step 'certificate subject'
+      Write-Host "    $owner" -ForegroundColor DarkGray
+    }
+  } else {
+    Write-Host '  No password given. A pkcs12 with an empty password cannot be read on' -ForegroundColor Yellow
+    Write-Host '  Windows, so the certificate name and team id will be asked for.' -ForegroundColor Yellow
+    Write-Host '  This is fine: the build runs on macOS, where security import can' -ForegroundColor DarkGray
+    Write-Host '  still open it.' -ForegroundColor DarkGray
   }
-  $listing = (& $keytool -list -v -keystore $p12 -storetype PKCS12 -storepass $pw12 2>&1) -join "`n"
-  if ($listing -notmatch 'Owner:') { Write-Fail 'that password did not open the .p12' }
 
-  $owner = ([regex]::Match($listing, '(?m)^\s*Owner:\s*(.+)$')).Groups[1].Value.Trim()
-  Write-Step "certificate subject"
-  Write-Host "    $owner" -ForegroundColor DarkGray
-
-  $cn = ([regex]::Match($owner, 'CN=([^,]+)')).Groups[1].Value.Trim()
-  $team = ([regex]::Match($cn, '\(([A-Z0-9]{10})\)')).Groups[1].Value
-
-  if (-not $team) {
-    Write-Host '    could not read a 10 character team id from that subject.' -ForegroundColor Yellow
-    $team = (Read-Host '  Team ID (Keys > Membership)').Trim()
+  if ($owner) {
+    $cn = ([regex]::Match($owner, 'CN=([^,]+)')).Groups[1].Value.Trim()
+    $team = ([regex]::Match($cn, '\(([A-Z0-9]{10})\)')).Groups[1].Value
+    if (-not $team) {
+      Write-Host '    no team id in that subject, so it will be asked for.' -ForegroundColor Yellow
+      $team = (Read-Host '  Team ID (Keys > Membership)').Trim()
+    }
+    $certName = $cn
+  } else {
+    $certName = (Read-Host '  certificate name, exactly as the portal shows it (Keys > Certificates)').Trim()
+    $team    = (Read-Host '  Team ID (Keys > Membership)').Trim()
+    if (-not $certName) { Write-Fail 'certificate name is empty' }
   }
+
   if ($team -notmatch '^[A-Z0-9]{10}$') { Write-Fail "team id looks wrong: $team" }
   Write-Step "team id           $team"
 
-  $certName = $cn
-  if ($cn -notmatch 'Apple Distribution|iPhone Distribution') {
-    Write-Host '    that certificate is not an Apple Distribution certificate.' -ForegroundColor Yellow
-    Write-Host '    the archive step will fail with a signing error.' -ForegroundColor Yellow
+  if ($certName -notmatch 'Apple Distribution|iPhone Distribution') {
+    Write-Host '    that does not look like an Apple Distribution certificate.' -ForegroundColor Yellow
+    Write-Host '    the archive step will fail with a signing error if it is not.' -ForegroundColor Yellow
   }
   Write-Step "cert name         $certName"
 

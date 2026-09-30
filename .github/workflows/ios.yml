@@ -115,6 +115,11 @@ jobs:
           security create-keychain -p ci "$KEYCHAIN"
           security default-keychain -s "$KEYCHAIN"
           security unlock-keychain -p ci "$KEYCHAIN"
+
+          # An empty -P is not the same as omitting it: security prompts for the
+          # password when the flag is absent, which would hang a CI run. A
+          # pkcs12 exported with no password is still imported correctly by
+          # passing an explicitly empty string.
           security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
             -P "$CERT_PASSWORD" -T /usr/bin/codesign -A
 
@@ -123,6 +128,13 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s -k ci "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
           security find-identity -v -p codesigning
+
+          # find-identity exits non-zero when it finds nothing, which set -e would
+          # turn into a confusing failure. Report it plainly instead.
+          if ! security find-identity -v -p codesigning | grep -q "Apple Distribution"; then
+            echo "::error::No Apple Distribution identity in the keychain. The .p12 is wrong, or its password is."
+            exit 1
+          fi
 
       - name: Archive
         env:
