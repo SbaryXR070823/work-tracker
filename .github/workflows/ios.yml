@@ -252,6 +252,65 @@ jobs:
           console.log('patch 2: boxed 7 call scoped pointers, no bare captures left');
           JS
 
+      # The version has to be written into app.json before prebuild runs, because
+      # that is the only input prebuild reads. It writes a literal into the
+      # generated Info.plist:
+      #
+      #   CFBundleShortVersionString: config.ios?.version || config.version
+      #   CFBundleVersion:            config.ios?.buildNumber || '1'
+      #
+      # in @expo/config-plugins/build/ios/Version.js. Nothing in that file refers
+      # to $(MARKETING_VERSION) or $(CURRENT_PROJECT_VERSION), so passing those to
+      # xcodebuild as build settings does nothing. Run 7 passed
+      # MARKETING_VERSION=1.0.1 and CURRENT_PROJECT_VERSION=7 and still uploaded
+      # 1.0.0 build 1, because app.json declared version 1.0.0 and no buildNumber.
+      #
+      # The build number is tied to the run number so it always increases, since
+      # TestFlight rejects a build number it has already seen. A fixed value in
+      # app.json would make every upload after the first one a duplicate.
+      #
+      # Stamping app.json rather than the generated plist also keeps the Expo
+      # runtimeVersion consistent. It is derived from expo.version, so a plist
+      # edited behind its back would ship a binary whose update channel is keyed
+      # to a version the binary does not report.
+      - name: Stamp the version into app.json
+        env:
+          VERSION_NAME: ${{ inputs.versionName }}
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          node <<'JS'
+          const fs = require('fs');
+          const raw = fs.readFileSync('app.json', 'utf8');
+          const cfg = JSON.parse(raw);
+          const expo = cfg.expo || (cfg.expo = {});
+
+          const version = process.env.VERSION_NAME;
+          const build = process.env.BUILD_NUMBER;
+          if (!/^\d+(\.\d+){0,2}$/.test(version)) {
+            console.log('::error::versionName must look like 1.0.1, got: ' + version);
+            process.exit(1);
+          }
+          if (!/^[1-9]\d*$/.test(build)) {
+            console.log('::error::the build number must be a positive integer, got: ' + build);
+            process.exit(1);
+          }
+
+          expo.version = version;
+          expo.ios = Object.assign({}, expo.ios, { buildNumber: build });
+          fs.writeFileSync('app.json', JSON.stringify(cfg, null, 2) + '\n');
+
+          // Read the file back rather than trusting the object in memory, so this
+          // asserts what prebuild will actually see on disk.
+          const check = JSON.parse(fs.readFileSync('app.json', 'utf8'));
+          if (check.expo.version !== version || check.expo.ios.buildNumber !== build) {
+            console.log('::error::app.json was written but does not read back as expected');
+            process.exit(1);
+          }
+          console.log('app.json now declares version ' + check.expo.version +
+                      ' build ' + check.expo.ios.buildNumber);
+          JS
+
       # ios/ is gitignored, so the Xcode project is generated fresh every run.
       # --clean guarantees the signing settings are never inherited from a
       # previous build, which is the most common cause of a stale-team error.
@@ -433,9 +492,12 @@ jobs:
         run: |
           set -euo pipefail
           SCHEME="${{ steps.names.outputs.scheme }}"
-          # CURRENT_PROJECT_VERSION is CFBundleVersion. TestFlight rejects a
-          # build number it has already seen, so this is tied to the run number
-          # rather than a fixed value in app.json.
+          # MARKETING_VERSION and CURRENT_PROJECT_VERSION are deliberately absent.
+          # They look like the right place to control the version, but the
+          # generated Info.plist holds literal strings written by prebuild, and
+          # nothing references these build settings, so passing them changes
+          # nothing. The version is stamped into app.json before prebuild runs,
+          # which is the only place the generated plist actually reads from.
           xcodebuild \
             -workspace "ios/$SCHEME.xcworkspace" \
             -scheme "$SCHEME" \
@@ -446,8 +508,6 @@ jobs:
             CODE_SIGN_STYLE=Manual \
             PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
             CODE_SIGN_IDENTITY="$CERT_NAME" \
-            CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
-            MARKETING_VERSION="${{ inputs.versionName || '1.0.0' }}" \
             archive
 
           # The action above must be 'archive', not 'build'. With 'build', xcodebuild
@@ -500,13 +560,22 @@ jobs:
         if: always()
         run: security delete-keychain build-ci.keychain || true
 
-      # A tag push has no inputs at all, and GitHub coerces a missing input to false
-      # when it is compared with one, so 'inputs.upload != false' evaluates to
-      # false and the upload was silently skipped on every v* tag. Testing for
-      # the empty case explicitly makes a tag push upload, which is the point of
-      # tagging, while an explicit upload=false is still honoured.
+      # The gate has to name all three of 'true', true and empty.
+      #
+      # A tag push has no inputs at all, so inputs.upload is empty and has to
+      # upload, since tagging exists to release.
+      #
+      # 'true' and true cover a value that arrived as a boolean and as the string
+      # 'true'.
+      #
+      # Nothing else uploads, and that is the point. Run 7 was dispatched with
+      # upload=false and uploaded anyway, because the dispatch API delivers every
+      # input as a string, and the string 'false' is truthy in an if condition.
+      # So the earlier 'inputs.upload == null || inputs.upload' looked correct and
+      # was not. Comparing against the string 'true' as well is what makes an
+      # explicit upload=false honoured, which is what the description promises.
       - name: Upload to TestFlight
-        if: inputs.upload == null || inputs.upload
+        if: inputs.upload == null || inputs.upload == true || inputs.upload == 'true'
         env:
           KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
