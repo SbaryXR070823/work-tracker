@@ -627,6 +627,23 @@ jobs:
           GROUP_NAME: External
         run: |
           set -euo pipefail
+          # Trimmed before the path is built, not only inside the script below.
+          # A key id that arrived with a trailing newline would otherwise name a
+          # file that does not exist, and the step would report a missing key when
+          # the key is sitting right there under its real name.
+          #
+          # The comparison is against the value as it arrived, so the log can say
+          # that something was cleaned. A secret that needed cleaning is worth
+          # knowing about, because the same value is what the upload step passes
+          # to altool, and a discrepancy between the two would be baffling later.
+          for name in KEY_ID ISSUER_ID; do
+            raw="${!name}"
+            clean="$(printf '%s' "$raw" | tr -d '[:space:]' | tr -d "\"'")"
+            if [ "$raw" != "$clean" ]; then
+              echo "::notice::$name arrived with padding or quotes on it, which were removed"
+            fi
+            export "${name?}=$clean"
+          done
           KEY_FILE="$HOME/.appstoreconnect/private_keys/AuthKey_$KEY_ID.p8"
           if [ ! -f "$KEY_FILE" ]; then
             echo "::error::$KEY_FILE is missing, so the upload step did not run"
@@ -640,9 +657,32 @@ jobs:
           // The base URL is overridable only so this step can be exercised
           // against a mock. It is not set by the workflow.
           const API = process.env.ASC_API || 'https://api.appstoreconnect.apple.com';
-          const KEY_ID = process.env.KEY_ID;
-          const ISSUER_ID = process.env.ISSUER_ID;
-          const BUILD_NUMBER = process.env.BUILD_NUMBER;
+          // A secret pasted through a text box, or set from a file, can arrive
+          // with a trailing newline, a carriage return, or a pair of surrounding
+          // quotes. altool strips all of those silently, so the upload succeeds
+          // while a token built from the very same values is refused with a bare
+          // 401 and nothing to act on. That is how the first real run failed.
+          //
+          // Whitespace is removed from the ends only. Interior characters are
+          // left alone, because a key id and an issuer id are a short token and
+          // a UUID, neither of which legitimately contains whitespace, so a
+          // mismatch here is worth reporting rather than quietly normalised.
+          function tidy(value) {
+            let v = (value || '').replace(/^[\s"']+|[\s"']+$/g, '');
+            const original = value || '';
+            if (v !== original) {
+              console.log('a secret arrived with padding or quotes on it, which were removed');
+            }
+            if (/\s/.test(v)) {
+              throw new Error('a secret still contains whitespace after trimming, so it is not ' +
+                'a valid key id or issuer id. Set the secret again from the App Store Connect ' +
+                'page without copying any surrounding text.');
+            }
+            return v;
+          }
+          const KEY_ID = tidy(process.env.KEY_ID);
+          const ISSUER_ID = tidy(process.env.ISSUER_ID);
+          const BUILD_NUMBER = (process.env.BUILD_NUMBER || '').trim();
           const GROUP_NAME = process.env.GROUP_NAME;
           const BUNDLE_ID = process.env.APP_BUNDLE_ID;
           const KEY_FILE = process.env.HOME + '/.appstoreconnect/private_keys/AuthKey_' + KEY_ID + '.p8';
@@ -691,6 +731,32 @@ jobs:
             return cached.value;
           }
 
+          // Describes a token without revealing it. The signature is reported by
+          // length and by whether it verifies against the key's own public half,
+          // which is enough to tell a signing problem from a claims problem
+          // without printing a single byte of the key.
+          function describeToken() {
+            try {
+              const parts = cached.value.split('.');
+              const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString());
+              const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
+              const signature = Buffer.from(parts[2], 'base64url');
+              const pub = crypto.createPublicKey(fs.readFileSync(KEY_FILE, 'utf8'));
+              const verifies = crypto.verify('sha256', Buffer.from(parts[0] + '.' + parts[1]),
+                { key: pub, dsaEncoding: 'ieee-p1363' }, signature);
+              return [
+                'header alg=' + header.alg + ' kid length=' + (header.kid || '').length,
+                'claims iss length=' + (claims.iss || '').length +
+                  ' iss looks like a uuid=' + /^[0-9a-f-]{36}$/i.test(claims.iss || ''),
+                'claims lifetime=' + (claims.exp - claims.iat) + 's, iat is ' +
+                  new Date(claims.iat * 1000).toISOString(),
+                'signature is ' + signature.length + ' bytes, verifies=' + verifies,
+              ].join('; ');
+            } catch (e) {
+              return 'could not be decoded (' + e.message + ')';
+            }
+          }
+
           // Every failure prints Apple's own status and message. A 403 here means
           // the API key lacks a role, and a 409 on the review submission usually
           // means Beta App Information has not been filled in yet. Those two look
@@ -710,6 +776,14 @@ jobs:
               err.body = (parsed && parsed.errors)
                 ? JSON.stringify(parsed.errors)
                 : text.slice(0, 900);
+              // A 401 is the one failure Apple explains least. The token is
+              // decoded and described here, never printed, so the log says
+              // whether the key id, the issuer id, the lifetime or the signature
+              // is the wrong one. Without this the only clue is that something
+              // about a token is wrong, which is not enough to act on.
+              if (res.status === 401) {
+                err.body += '\ntoken: ' + describeToken();
+              }
               throw err;
             }
             return parsed;
