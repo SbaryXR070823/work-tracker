@@ -1,0 +1,371 @@
+# Adds the most recent build to an external TestFlight group.
+#
+# This exists as a separate file on purpose. The main iOS workflow builds and
+# uploads, and it should never be made to look broken by something that only
+# affects distribution. A failure here leaves the build in TestFlight and the
+# main workflow green, which is the whole point of splitting it.
+#
+# What this cannot do is approve anything. The first external build for an app
+# has to clear Apple's Beta App Review, which is a human step and always has
+# been. Every build after that reaches the testers without it.
+name: External TestFlight
+
+on:
+  workflow_dispatch:
+    inputs:
+      buildNumber:
+        description: 'Build number to publish, as CFBundleVersion. Defaults to the most recent one.'
+        required: false
+        type: string
+      groupName:
+        description: 'Name of the external testing group'
+        required: false
+        default: 'External'
+        type: string
+      submitForReview:
+        description: 'Submit to Beta App Review if the app has not cleared it before'
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: testflight-external-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Add the build to the external group
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    env:
+      KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      KEY_P8: ${{ secrets.APP_STORE_CONNECT_KEY_P8 }}
+      APP_BUNDLE_ID: com.sbxworktracker.app
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      # A secret pasted through a text box, or set from a file, can arrive with a
+      # trailing newline, a carriage return, or a pair of surrounding quotes. The
+      # main workflow gets this for free because altool strips them silently.
+      # This workflow builds its own token, so it has to do the same thing, and
+      # has to do it before the key id is used to build a file path.
+      #
+      # The comparison is against the value as it arrived so the log can say that
+      # something was cleaned, which matters because the same value is what the
+      # main workflow hands to altool.
+      - name: Clean up the API credentials
+        run: |
+          set -euo pipefail
+          for name in KEY_ID ISSUER_ID; do
+            raw="${!name}"
+            clean="$(printf '%s' "$raw" | tr -d '[:space:]' | tr -d "\"'")"
+            if [ "$raw" != "$clean" ]; then
+              echo "::notice::$name arrived with padding or quotes on it, which were removed"
+            fi
+            export "${name?}=$clean"
+          done
+
+      - name: Add the build to the external TestFlight group
+        env:
+          BUILD_NUMBER: ${{ inputs.buildNumber }}
+          GROUP_NAME: ${{ inputs.groupName }}
+          SUBMIT_FOR_REVIEW: ${{ inputs.submitForReview }}
+        run: |
+          set -euo pipefail
+
+          # altool has no internal or external switch, which is why a build it
+          # uploads is offered to internal testers only, and why inviting anyone
+          # is impossible. Internal testing reaches only the people who already
+          # have a role in App Store Connect, so an external group is the only
+          # route to anybody else.
+          KEY_DIR="$HOME/.appstoreconnect/private_keys"
+          mkdir -p "$KEY_DIR"
+          printf '%s' "$KEY_P8" > "$KEY_DIR/AuthKey_$KEY_ID.p8"
+          chmod 600 "$KEY_DIR/AuthKey_$KEY_ID.p8"
+
+          node <<'JS'
+          const fs = require('fs');
+          const crypto = require('crypto');
+
+          const API = process.env.ASC_API || 'https://api.appstoreconnect.apple.com';
+          const KEY_ID = process.env.KEY_ID;
+          const ISSUER_ID = process.env.ISSUER_ID;
+          const BUNDLE_ID = process.env.APP_BUNDLE_ID;
+          const GROUP_NAME = process.env.GROUP_NAME;
+          const KEY_FILE = process.env.HOME + '/.appstoreconnect/private_keys/AuthKey_' + KEY_ID + '.p8';
+          // A missing build number means the most recent one, which is what
+          // someone publishing by hand almost always wants.
+          const WANTED = (process.env.BUILD_NUMBER || '').trim();
+          const SUBMIT = process.env.SUBMIT_FOR_REVIEW !== 'false';
+
+          // The poll interval is overridable so this step can be exercised
+          // against a mock without waiting a minute per attempt.
+          const POLL_MS = Number(process.env.ASC_POLL_MS || 60000);
+          const ATTEMPTS = Number(process.env.ASC_ATTEMPTS || 20);
+
+          // Terminal states. Retrying cannot improve these.
+          const DEAD = ['FAILED', 'INVALID', 'REJECTED'];
+          // Any of these mean external review has already been cleared for the
+          // app, so a new build in that group needs no fresh submission.
+          const CLEARED = ['IN_BETA_TESTING', 'IN_BETA_REVIEW', 'IN_BETA_APPROVAL',
+                           'WAITING_FOR_BETA_REVIEW', 'READY_FOR_BETA_SUBMISSION'];
+
+          const b64u = (b) => Buffer.from(b).toString('base64')
+            .replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+
+          // Apple caps a token at 20 minutes and rejects longer ones with a bare
+          // 401. It is cached because the poll below makes many calls.
+          let cached = null;
+          function token() {
+            if (cached && Date.now() < cached.until) return cached.value;
+            let key;
+            try {
+              key = fs.readFileSync(KEY_FILE, 'utf8');
+            } catch (e) {
+              throw new Error('the API key at ' + KEY_FILE + ' could not be read: ' + e.message);
+            }
+            const now = Math.floor(Date.now() / 1000);
+            const signingInput = b64u(JSON.stringify({ alg: 'ES256', kid: KEY_ID, typ: 'JWT' })) + '.' +
+              b64u(JSON.stringify({ iss: ISSUER_ID, iat: now, exp: now + 900 }));
+            // ieee-p1363 is the raw 64 byte r||s form JOSE requires. The default
+            // is DER wrapped, which Apple answers with 401 and no explanation.
+            let sig;
+            try {
+              sig = crypto.sign('sha256', Buffer.from(signingInput), { key: key, dsaEncoding: 'ieee-p1363' });
+            } catch (e) {
+              // OpenSSL's own message is a decoder routine code that names
+              // neither the key nor the cause. The realistic cause is a secret
+              // whose newlines were stripped on the way in.
+              throw new Error('the API key at ' + KEY_FILE + ' is not a usable P-256 key (' +
+                e.message + '). If it was pasted through a text box the newlines may have ' +
+                'been stripped, and the secret needs setting again.');
+            }
+            cached = { value: signingInput + '.' + b64u(sig), until: Date.now() + 10 * 60 * 1000 };
+            return cached.value;
+          }
+
+          // Describes a token without revealing it. A 401 from Apple names
+          // neither the key id, the issuer id, nor the signature, so without
+          // this the only clue is that something about a token is wrong, which
+          // is not enough to act on.
+          function describeToken() {
+            try {
+              const parts = cached.value.split('.');
+              const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString());
+              const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
+              const signature = Buffer.from(parts[2], 'base64url');
+              const pub = crypto.createPublicKey(fs.readFileSync(KEY_FILE, 'utf8'));
+              const verifies = crypto.verify('sha256', Buffer.from(parts[0] + '.' + parts[1]),
+                { key: pub, dsaEncoding: 'ieee-p1363' }, signature);
+              return [
+                'header alg=' + header.alg + ' kid length=' + (header.kid || '').length,
+                'claims iss length=' + (claims.iss || '').length +
+                  ' iss looks like a uuid=' + /^[0-9a-f-]{36}$/i.test(claims.iss || ''),
+                'claims lifetime=' + (claims.exp - claims.iat) + 's, iat is ' +
+                  new Date(claims.iat * 1000).toISOString(),
+                'signature is ' + signature.length + ' bytes, verifies=' + verifies,
+              ].join('; ');
+            } catch (e) {
+              return 'could not be decoded (' + e.message + ')';
+            }
+          }
+
+          // Every failure prints Apple's own status and message. A 403 means the
+          // API key lacks a role, and a 409 on the review submission usually
+          // means Beta App Information has not been filled in yet. Those two look
+          // identical without the response body, so it is never swallowed.
+          async function api(method, path, body) {
+            const res = await fetch(API + path, {
+              method: method,
+              headers: { Authorization: 'Bearer ' + token(), 'Content-Type': 'application/json' },
+              body: body === undefined ? undefined : JSON.stringify(body),
+            });
+            const text = await res.text();
+            let parsed = null;
+            try { parsed = text ? JSON.parse(text) : null; } catch (e) { /* not json */ }
+            if (!res.ok) {
+              const err = new Error(method + ' ' + path + ' returned ' + res.status);
+              err.status = res.status;
+              err.body = (parsed && parsed.errors)
+                ? JSON.stringify(parsed.errors)
+                : text.slice(0, 900);
+              if (res.status === 401) err.body += '\ntoken: ' + describeToken();
+              throw err;
+            }
+            return parsed;
+          }
+
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+          async function run() {
+            const apps = await api('GET', '/v1/apps?filter[bundleId]=' +
+              encodeURIComponent(BUNDLE_ID) + '&limit=1');
+            if (!apps.data || apps.data.length !== 1) {
+              throw new Error('expected exactly one app for bundle id ' + BUNDLE_ID +
+                ', found ' + ((apps.data && apps.data.length) || 0));
+            }
+            const appId = apps.data[0].id;
+            console.log('app ' + BUNDLE_ID + ' is ' + appId);
+
+            const listed = await api('GET', '/v1/betaGroups?filter[app]=' + appId + '&limit=200');
+            const all = listed.data || [];
+            console.log('beta groups: ' + all.length + (all.length ? ' (' + all.map(
+              (g) => (g.attributes.isInternalGroup ? 'internal' : 'external') +
+                ' "' + g.attributes.name + '"').join(', ') + ')' : ''));
+
+            let group = all.find((g) => g.attributes.isInternalGroup === false &&
+                                       g.attributes.name === GROUP_NAME);
+            if (group) {
+              console.log('reusing external group ' + group.id);
+            } else {
+              console.log('no external group named "' + GROUP_NAME + '", creating it');
+              const made = await api('POST', '/v1/betaGroups', { data: {
+                attributes: { name: GROUP_NAME, isInternalGroup: false },
+                relationships: { app: { data: { type: 'apps', id: appId } } },
+              }});
+              group = made.data;
+              console.log('created external group ' + group.id);
+            }
+
+            // Whether review has been cleared is read from the group rather than
+            // assumed, so the first run submits and later runs do not.
+            const existing = await api('GET', '/v1/betaGroups/' + group.id +
+              '/builds?limit=200&fields[builds]=version,processingState');
+            const cleared = (existing.data || []).some(
+              (b) => CLEARED.indexOf(b.attributes.processingState) !== -1);
+            console.log('builds already in the group: ' + (existing.data || []).length +
+              ', external review already cleared: ' + cleared);
+
+            // The build is located by its build number, which is the run number
+            // of the build workflow. The builds endpoint filters on that and not
+            // on the marketing version, and matching on the version would be
+            // guesswork.
+            let filter = '/v1/builds?filter[app]=' + appId + '&limit=50';
+            if (WANTED) filter += '&filter[version]=' + encodeURIComponent(WANTED);
+            console.log(WANTED
+              ? 'looking for build ' + WANTED
+              : 'no build number given, so the most recent one is used');
+
+            let build = null;
+            for (let i = 0; i < ATTEMPTS; i++) {
+              const found = await api('GET', filter);
+              const list = found.data || [];
+              if (list.length > 0) {
+                // Without an explicit number the endpoint does not promise an
+                // order, so the highest build number is chosen rather than the
+                // first entry, which would be arbitrary.
+                build = WANTED ? list[0]
+                  : list.slice().sort((a, b) =>
+                      Number(b.attributes.version) - Number(a.attributes.version))[0];
+                const state = build.attributes.processingState;
+                if (DEAD.indexOf(state) !== -1) {
+                  throw new Error('build ' + build.attributes.version + ' is ' + state +
+                    ', which will not improve on its own. Check it in App Store Connect.');
+                }
+                if (state !== 'PROCESSING' && state !== 'UPLOADED') {
+                  console.log('build ' + build.attributes.version + ' is ' + state);
+                  break;
+                }
+                console.log('  build ' + build.attributes.version + ' is still ' + state + ', waiting');
+              } else {
+                console.log('  no matching build yet, waiting');
+              }
+              build = null;
+              await sleep(POLL_MS);
+            }
+            if (!build) {
+              throw new Error(WANTED
+                ? 'build ' + WANTED + ' never became available in App Store Connect'
+                : 'no usable build became available in App Store Connect');
+            }
+
+            try {
+              await api('POST', '/v1/betaGroups/' + group.id + '/relationships/builds',
+                { data: [{ type: 'builds', id: build.id }] });
+              console.log('added build ' + build.attributes.version + ' to the external group');
+            } catch (e) {
+              // 409 or 422 means it is already in the group, which is the state
+              // being aimed for and happens on every re-run.
+              if (e.status === 409 || e.status === 422) {
+                console.log('build ' + build.attributes.version + ' was already in the group');
+              } else {
+                throw e;
+              }
+            }
+
+            if (cleared) {
+              console.log('external review was already cleared, so this build reaches the ' +
+                'testers directly and needs no new submission');
+            } else if (!SUBMIT) {
+              console.log('this app has not cleared external review, and submitting was not ' +
+                'asked for, so nothing was filed. Add the build by hand in App Store Connect ' +
+                'and submit it there.');
+            } else {
+              console.log('this app has not cleared external review yet, submitting the build');
+              try {
+                const sub = await api('POST', '/v1/betaAppReviewSubmissions', { data: {
+                  relationships: { build: { data: { type: 'builds', id: build.id } } },
+                }});
+                console.log('beta review submission ' + (sub.data && sub.data.id) + ' created');
+              } catch (e) {
+                if (e.status === 409) {
+                  // A 409 here has two causes that cannot be told apart from the
+                  // response alone: a submission that already exists, and Beta
+                  // App Information that has not been filled in. Neither is
+                  // guessed at, because saying "already submitted" when the real
+                  // problem is missing beta information sends the reader to the
+                  // wrong page.
+                  console.log('the submission was not accepted, status 409: ' + e.body);
+                  console.log('this is either a submission that already exists, or Beta App');
+                  console.log('Information that is still empty under TestFlight. Both are');
+                  console.log('fixed by hand in App Store Connect, not by rerunning this.');
+                } else {
+                  throw e;
+                }
+              }
+            }
+
+            const after = await api('GET', '/v1/builds/' + build.id +
+              '?fields[builds]=processingState,version,expired');
+            const state = after.data.attributes.processingState;
+            console.log('');
+            console.log('build ' + build.attributes.version + ' is now ' + state);
+            console.log('external group "' + group.attributes.name + '" is ' + group.id);
+            if (state !== 'IN_BETA_TESTING') {
+              console.log('');
+              console.log('External testers cannot install this build until Apple approves it.');
+              console.log('Beta App Review is a human step, and only the first external build');
+              console.log('needs it. Watch it under TestFlight, then add people to the group or');
+              console.log('turn on its public link.');
+            } else {
+              console.log('');
+              console.log('The build is available to external testers. Invite them under');
+              console.log('TestFlight, or turn on the group\'s public link.');
+            }
+          }
+
+          run().catch((e) => {
+            console.log('::error::' + e.message);
+            if (e.body) console.log('::error::Apple said: ' + e.body);
+            console.log('::error::this workflow only distributes. It does not build, and it');
+            console.log('::error::cannot affect a build that is already in TestFlight. If the');
+            console.log('::error::build itself is fine, do it by hand under TestFlight.');
+            // The exit code is set and the loop is allowed to drain rather than
+            // exiting outright. A hard exit while a fetch socket is still open
+            // tears the process down mid handshake, which prints a libuv
+            // assertion and turns a clean exit 1 into 127. The socket is closed
+            // explicitly so the drain cannot wait on Apple's keep alive window,
+            // and the timer is a backstop so a wedged handle still ends the step.
+            const d = globalThis[Symbol.for('undici.globalDispatcher.1')];
+            if (d && d.close) d.close();
+            process.exitCode = 1;
+            setTimeout(() => process.exit(1), 3000).unref();
+          });
+          JS
