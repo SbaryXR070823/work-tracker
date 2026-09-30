@@ -45,11 +45,20 @@ jobs:
           node-version: 22
           cache: npm
 
+      # The runner image already has CocoaPods. Installing it again costs several
+      # minutes and can fail on a native extension build, so it is only done if
+      # pod is genuinely missing. The version is echoed either way, because the
+      # log is the only place a toolchain mismatch would show up.
       - name: Set up CocoaPods
         run: |
           set -euo pipefail
-          sudo gem install cocoapods --no-document
-          pod --version
+          if ! command -v pod >/dev/null 2>&1; then
+            echo "pod not on this image, installing it"
+            sudo gem install cocoapods --no-document
+          fi
+          echo "pods: $(pod --version)"
+          echo "ruby: $(ruby --version)"
+          echo "xcode: $(xcodebuild -version | head -n1)"
 
       - name: Install dependencies
         run: npm ci
@@ -57,7 +66,11 @@ jobs:
       # ios/ is gitignored, so the Xcode project is generated fresh every run.
       # --clean guarantees the signing settings are never inherited from a
       # previous build, which is the most common cause of a stale-team error.
+      # CI is set so prebuild never stops on a prompt it cannot answer.
       - name: Generate the iOS project
+        env:
+          CI: 'true'
+          EXPO_NO_TELEMETRY: '1'
         run: npx expo prebuild --platform ios --clean
 
       - name: Install pods
@@ -199,8 +212,13 @@ jobs:
         if: always()
         run: security delete-keychain build-ci.keychain || true
 
+      # A tag push has no inputs at all, and GitHub coerces a missing input to false
+      # when it is compared with one, so 'inputs.upload != false' evaluates to
+      # false and the upload was silently skipped on every v* tag. Testing for
+      # the empty case explicitly makes a tag push upload, which is the point of
+      # tagging, while an explicit upload=false is still honoured.
       - name: Upload to TestFlight
-        if: inputs.upload != false
+        if: inputs.upload == null || inputs.upload
         env:
           KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
