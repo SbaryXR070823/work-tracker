@@ -75,6 +75,34 @@ jobs:
       # A distribution certificate is a one-time export from the Apple Developer
       # portal. It goes into a throwaway keychain, and the keychain is deleted
       # again below so nothing survives on the runner.
+      #
+      # -allowProvisioningUpdates cannot download a profile on its own: that needs
+      # App Store Connect API credentials handed to xcodebuild, which this workflow
+      # does not do. The profile is therefore installed here from a secret, and the
+      # archive step then signs against it directly. This is the difference between
+      # "No profiles for 'com.worktracker.app' were found" and a working build.
+      - name: Install the provisioning profile
+        env:
+          PROFILE_BASE64: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PROFILE_BASE64" ]; then
+            echo "::error::APPLE_PROVISIONING_PROFILE_BASE64 is not set, so there is no profile to install"
+            exit 1
+          fi
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          echo "$PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
+          # Xcode indexes profiles by the UUID in the filename, so the file is
+          # named by UUID rather than by the display name the portal shows.
+          UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" \
+            "$RUNNER_TEMP/profile.mobileprovision")
+          NAME=$(/usr/libexec/PlistBuddy -c "Print :Name" \
+            "$RUNNER_TEMP/profile.mobileprovision")
+          echo "Installing profile '$NAME' ($UUID)"
+          mv "$RUNNER_TEMP/profile.mobileprovision" \
+            "$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
+          security cms -D -i "$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision" > /dev/null
+
       - name: Import the distribution certificate
         env:
           CERT_P12_BASE64: ${{ secrets.APPLE_DISTRIBUTION_CERT_P12_BASE64 }}
@@ -113,7 +141,6 @@ jobs:
             -configuration Release \
             -archivePath "build/$SCHEME.xcarchive" \
             -destination 'generic/platform=iOS' \
-            -allowProvisioningUpdates \
             DEVELOPMENT_TEAM="$TEAM_ID" \
             CODE_SIGN_STYLE=Manual \
             PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
