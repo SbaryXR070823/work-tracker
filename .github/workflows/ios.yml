@@ -142,11 +142,15 @@ jobs:
             echo "::error::Either the bundle id in app.json or the profile is wrong. They cannot both be right."
             exit 1
           fi
-          # The expiry check is deliberately lenient about the format. If the date does
-          # not parse, an empty result would look like the epoch and the build
-          # would claim an unexpired profile is expired. Warn and carry on
-          # instead, because xcodebuild rejects a stale profile on its own.
-          EXP_EPOCH=$(date -j -f '%Y-%m-%dT%H:%M:%SZ' "$EXP" '+%s' 2>/dev/null || echo '')
+          # PlistBuddy prints a date as 'Wed Sep 29 08:44:58 UTC 2027', not as ISO, so
+          # both shapes are tried. The check stays lenient on purpose: a value
+          # that fails to parse must not be mistaken for the epoch, which would
+          # report an unexpired profile as expired.
+          EXP_EPOCH=''
+          for FMT in '%a %b %d %H:%M:%S %Z %Y' '%Y-%m-%dT%H:%M:%SZ'; do
+            EXP_EPOCH=$(date -j -f "$FMT" "$EXP" '+%s' 2>/dev/null || echo '')
+            [ -n "$EXP_EPOCH" ] && break
+          done
           if [ -z "$EXP_EPOCH" ]; then
             echo "::warning::could not parse the expiry '$EXP', leaving it to xcodebuild"
           elif [ "$EXP_EPOCH" -lt "$(date '+%s')" ]; then
@@ -173,25 +177,66 @@ jobs:
           security default-keychain -s "$KEYCHAIN"
           security unlock-keychain -p ci "$KEYCHAIN"
 
-          # An empty -P is not the same as omitting it: security prompts for the
-          # password when the flag is absent, which would hang a CI run. A
-          # pkcs12 exported with no password is still imported correctly by
-          # passing an explicitly empty string.
-          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
-            -P "$CERT_PASSWORD" -T /usr/bin/codesign -A
+          # security import cannot open a pkcs12 that has no password. It fails
+          # with "MAC verification failed during PKCS12 import (wrong password?)"
+          # no matter what is passed to -P, because the integrity check needs
+          # the password and an empty string is not the same as no password.
+          # openssl has no such restriction, so the file is converted to PEM here
+          # and the two halves are imported separately.
+          #
+          # pass: with nothing after it is a genuinely empty password, which is
+          # what this .p12 needs. A literal "$CERT_PASSWORD" in the argument
+          # would instead be a password consisting of that text.
+          if ! openssl pkcs12 -in "$RUNNER_TEMP/cert.p12" -passin "pass:$CERT_PASSWORD" \
+               -clcerts -nokeys -out "$RUNNER_TEMP/cert.raw" 2>"$RUNNER_TEMP/p12.err"; then
+            echo "::error::openssl could not open the .p12 with the configured password."
+            sed 's/^/::error::  /' "$RUNNER_TEMP/p12.err"
+            exit 1
+          fi
+          if ! openssl pkcs12 -in "$RUNNER_TEMP/cert.p12" -passin "pass:$CERT_PASSWORD" \
+               -nocerts -nodes -out "$RUNNER_TEMP/key.raw" 2>>"$RUNNER_TEMP/p12.err"; then
+            echo "::error::the certificate opened but the private key did not."
+            sed 's/^/::error::  /' "$RUNNER_TEMP/p12.err"
+            exit 1
+          fi
+
+          # openssl writes a friendly name and bag attributes before each BEGIN
+          # line. security import wants clean PEM, so everything above the first
+          # BEGIN is dropped.
+          strip_preamble() {
+            awk '/-----BEGIN/{keep=1} keep' "$1" > "$2"
+          }
+          strip_preamble "$RUNNER_TEMP/cert.raw" "$RUNNER_TEMP/cert.pem"
+          strip_preamble "$RUNNER_TEMP/key.raw"  "$RUNNER_TEMP/key.pem"
+
+          if ! grep -q "BEGIN PRIVATE KEY" "$RUNNER_TEMP/key.pem"; then
+            echo "::error::the .p12 opened but contains no private key."
+            echo "::error::That file is a certificate only, so nothing can be signed with it."
+            exit 1
+          fi
+          openssl pkey -in "$RUNNER_TEMP/key.pem" -noout -check
+          echo "private key extracted and structurally valid"
+
+          security import "$RUNNER_TEMP/cert.pem" -k "$KEYCHAIN" -T /usr/bin/codesign
+          security import "$RUNNER_TEMP/key.pem"  -k "$KEYCHAIN" -A
 
           # Without this, codesign cannot see the imported key and the archive
           # fails with "no matching key found" even though the import succeeded.
           security set-key-partition-list -S apple-tool:,apple: -s -k ci "$KEYCHAIN"
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
-          security find-identity -v -p codesigning
 
-          # find-identity exits non-zero when it finds nothing, which set -e would
-          # turn into a confusing failure. Report it plainly instead.
-          if ! security find-identity -v -p codesigning | grep -q "Apple Distribution"; then
-            echo "::error::No Apple Distribution identity in the keychain. The .p12 is wrong, or its password is."
+          # find-identity prints the holder's legal name, which for a public
+          # repository is a third party's personal detail in a public build log.
+          # The certificate type and team id are kept because they are what makes
+          # a mismatch diagnosable, and the name is what is redacted.
+          IDENTITIES=$(security find-identity -v -p codesigning || true)
+          echo "$IDENTITIES" | sed -E 's/(Distribution: )[^)]*(\(.*\))/\1<name withheld>\2/'
+          COUNT=$(echo "$IDENTITIES" | grep -c "Distribution:" || true)
+          if [ "$COUNT" -lt 1 ]; then
+            echo "::error::no signing identity in the keychain after the import"
             exit 1
           fi
+          echo "signing identities: $COUNT"
 
       - name: Archive
         env:
