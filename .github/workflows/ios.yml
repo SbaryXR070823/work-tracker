@@ -26,8 +26,10 @@ permissions:
 jobs:
   testflight:
     name: Archive and upload to TestFlight
-    # macos-15 matches the Xcode 16 on this image. Bump this only together with a
-    # deliberate SDK check; a mismatch here is the usual cause of "iOS SDK not found".
+    # macos-15 carries several Xcodes, from 16.3 up to 26.3. The default is the
+    # oldest of them, which is why the step below selects one explicitly rather
+    # than trusting xcode-select. Moving to macos-26 later is safe and needs no
+    # change here beyond the IOS_XCODE_VERSION default.
     runs-on: macos-15
     timeout-minutes: 60
 
@@ -40,6 +42,62 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@v4
+
+      # The image default is Xcode 16.4, whose Swift is 6.1. Expo SDK 57 pulls
+      # in a Swift package that declares swift-tools-version 6.2, so the archive
+      # died with "package 'apple' is using Swift tools version 6.2.0 but the
+      # installed version is 6.1.0", eight minutes into a run with no hint that
+      # the toolchain was the cause. Xcode 26 is already on the image, it just is
+      # not the default, so it is selected here.
+      #
+      # The version is a repository variable rather than a literal so a future
+      # image update does not need a code change, and so the error below can
+      # print the versions that are actually installed.
+      - name: Select Xcode
+        env:
+          WANT: ${{ vars.IOS_XCODE_VERSION || '26.3' }}
+        run: |
+          set -euo pipefail
+          echo "image default: $(xcodebuild -version | head -n1)"
+
+          FOUND=""
+          for APP in /Applications/Xcode*.app; do
+            [ -d "$APP" ] || continue
+            V=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+              "$APP/Contents/Info.plist" 2>/dev/null || echo "")
+            [ -n "$V" ] || continue
+            echo "  available: Xcode $V"
+            [ "$V" = "$WANT" ] && FOUND="$APP"
+          done
+
+          if [ -z "$FOUND" ]; then
+            echo "::error::Xcode $WANT is not on this image."
+            echo "::error::Set the IOS_XCODE_VERSION repository variable to one of the versions listed above."
+            exit 1
+          fi
+          sudo xcode-select -s "$FOUND"
+          echo "selected: $FOUND"
+          xcodebuild -version
+
+          # Confirm the Swift that xcode-select just switched to really is new
+          # enough, so the failure lands here as one line rather than inside the
+          # package resolution. An unrecognised banner only warns: refusing to
+          # build because a version string changed shape would be worse than
+          # letting the build decide for itself.
+          BANNER=$(swift --version 2>&1 | head -n1)
+          echo "swift: $BANNER"
+          SWIFT=$(printf '%s\n' "$BANNER" | sed -nE 's/.*Swift version ([0-9]+)\.([0-9]+).*/\1 \2/p' | head -n1)
+          if [ -z "$SWIFT" ]; then
+            echo "::warning::could not read a Swift version from that banner, leaving it to the build"
+          else
+            MAJOR=${SWIFT% *}; MINOR=${SWIFT#* }
+            echo "swift $MAJOR.$MINOR"
+            if [ "$MAJOR" -lt 6 ] || { [ "$MAJOR" -eq 6 ] && [ "$MINOR" -lt 2 ]; }; then
+              echo "::error::Swift $MAJOR.$MINOR is older than the 6.2 this build needs"
+              echo "::error::Xcode $WANT was selected but does not provide it."
+              exit 1
+            fi
+          fi
 
       - name: Set up Node
         uses: actions/setup-node@v4
