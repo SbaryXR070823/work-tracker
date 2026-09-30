@@ -32,8 +32,10 @@ jobs:
     timeout-minutes: 60
 
     env:
-      # Derived from app.json in a later step, but needed early for clarity.
-      APP_BUNDLE_ID: com.worktracker.app
+      # Must match expo.ios.bundleIdentifier in app.json. The provisioning
+      # profile is checked against this below, because a mismatch surfaces
+      # inside xcodebuild as an opaque signing error rather than as a wrong id.
+      APP_BUNDLE_ID: com.sbxworktracker.app
 
     steps:
       - name: Check out
@@ -104,17 +106,59 @@ jobs:
             exit 1
           fi
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+
           echo "$PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
+
+          # A .mobileprovision is a CMS signed message with the plist wrapped
+          # inside it, not a plist. Reading it directly makes PlistBuddy stop
+          # with "Unexpected character 0 at line 1", because byte zero of the
+          # file is the DER header 0x30. security cms -D unwraps it first.
+          security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+
+          UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID"          "$RUNNER_TEMP/profile.plist")
+          NAME=$(/usr/libexec/PlistBuddy -c "Print :Name"          "$RUNNER_TEMP/profile.plist")
+          TEAM=$(/usr/libexec/PlistBuddy -c "Print :TeamIdentifier:0" "$RUNNER_TEMP/profile.plist")
+          APPID=$(/usr/libexec/PlistBuddy -c "Print :Entitlements:application-identifier" "$RUNNER_TEMP/profile.plist")
+          EXP=$(/usr/libexec/PlistBuddy -c "Print :ExpirationDate" "$RUNNER_TEMP/profile.plist")
+          echo "profile name   $NAME"
+          echo "uuid           $UUID"
+          echo "team           $TEAM"
+          echo "covers         $APPID"
+          echo "expires        $EXP"
+
+          # Everything below is checked here rather than left to xcodebuild,
+          # which reports a mismatch as a signing error several steps later
+          # with none of this context.
+          if [ "$TEAM" != "${{ secrets.APPLE_TEAM_ID }}" ]; then
+            echo "::error::profile team '$TEAM' does not match APPLE_TEAM_ID. Fix the secret."
+            exit 1
+          fi
+          if [ "$NAME" != "${{ secrets.APPLE_PROVISIONING_PROFILE_NAME }}" ]; then
+            echo "::error::profile name '$NAME' does not match APPLE_PROVISIONING_PROFILE_NAME. Fix the secret."
+            exit 1
+          fi
+          if [ "$APPID" != "$TEAM.$APP_BUNDLE_ID" ]; then
+            echo "::error::profile covers '$APPID' but this app builds as '$TEAM.$APP_BUNDLE_ID'."
+            echo "::error::Either the bundle id in app.json or the profile is wrong. They cannot both be right."
+            exit 1
+          fi
+          # The expiry check is deliberately lenient about the format. If the date does
+          # not parse, an empty result would look like the epoch and the build
+          # would claim an unexpired profile is expired. Warn and carry on
+          # instead, because xcodebuild rejects a stale profile on its own.
+          EXP_EPOCH=$(date -j -f '%Y-%m-%dT%H:%M:%SZ' "$EXP" '+%s' 2>/dev/null || echo '')
+          if [ -z "$EXP_EPOCH" ]; then
+            echo "::warning::could not parse the expiry '$EXP', leaving it to xcodebuild"
+          elif [ "$EXP_EPOCH" -lt "$(date '+%s')" ]; then
+            echo "::error::profile expired on $EXP"
+            exit 1
+          fi
+
           # Xcode indexes profiles by the UUID in the filename, so the file is
           # named by UUID rather than by the display name the portal shows.
-          UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" \
-            "$RUNNER_TEMP/profile.mobileprovision")
-          NAME=$(/usr/libexec/PlistBuddy -c "Print :Name" \
-            "$RUNNER_TEMP/profile.mobileprovision")
-          echo "Installing profile '$NAME' ($UUID)"
           mv "$RUNNER_TEMP/profile.mobileprovision" \
             "$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
-          security cms -D -i "$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision" > /dev/null
+          echo "Installed $HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
 
       - name: Import the distribution certificate
         env:

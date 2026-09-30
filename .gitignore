@@ -33,7 +33,8 @@ android/.idea/
 *.keystore
 *.p8
 *.p12
-*.mobilepprovision
+*.mobileprovision
+*.provisionprofile
 *.cer
 *.certSigningRequest
 google-services.json

@@ -9,7 +9,7 @@
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.worktracker.app",
+      "bundleIdentifier": "com.sbxworktracker.app",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
       }
