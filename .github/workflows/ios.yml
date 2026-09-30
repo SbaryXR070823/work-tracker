@@ -123,35 +123,57 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # expo-modules-jsi 57.1.1 annotates both RuntimeScheduler constructors with
-      # SWIFT_RETURNS_RETAINED. A constructor returns nothing, so the attribute
-      # is meaningless, and Xcode 26 rejects it:
-      #   'RuntimeScheduler' cannot be annotated with either SWIFT_RETURNS_RETAINED
-      #   or SWIFT_RETURNS_UNRETAINED because it is not returning a
-      #   SWIFT_SHARED_REFERENCE type
-      # That is a bug in the package, and 57.1.1 is the newest release there is, so
-      # there is no version to upgrade to. Only the two attributes are dropped.
-      # The SWIFT_SHARED_REFERENCE on the class itself is what tells ARC to call
-      # retainRuntimeScheduler and releaseRuntimeScheduler, so it must survive, and
-      # the step fails rather than build if it does not. Swift never reads a
-      # constructor's return annotation: it only calls these as initializers.
+      # expo-modules-jsi does not compile with Xcode 26, which is also the only Xcode
+      # it can be built with. Two independent defects, both in the package.
       #
-      # Delete this step when the package is fixed upstream. The count check is
-      # what makes that visible instead of silently patching nothing.
+      # 1. Both RuntimeScheduler constructors are annotated SWIFT_RETURNS_RETAINED.
+      #    A constructor returns nothing, so the attribute is meaningless, and clang
+      #    rejects it: 'RuntimeScheduler' cannot be annotated with either
+      #    SWIFT_RETURNS_RETAINED or SWIFT_RETURNS_UNRETAINED because it is not
+      #    returning a SWIFT_SHARED_REFERENCE type.
+      #
+      # 2. Three JSI pointers are captured into a JavaScriptActor closure, and Swift
+      #    6.2 region isolation rejects all seven uses with
+      #      sending 'thisPtr' risks causing data races
+      #    The package's own answer to this is already in its source, next to
+      #    CFRunLoopGetCurrent(): "Wrapped in NonisolatedUnsafeVar instead of
+      #    nonisolated(unsafe) let to work around a Swift 6.2.3 compiler bug". The
+      #    seven failing sites still use the weaker nonisolated(unsafe) let, so this
+      #    step applies the package's own idiom to them rather than inventing one.
+      #    The sibling setter at line 199 escapes the same diagnostic only because it
+      #    moves the pointer out before entering the isolated closure, which confirms
+      #    the capture is the sole trigger.
+      #
+      # There is no version to move to. Every release from 57.0.8 to 58.0.5 declares
+      # swift-tools-version 6.2 and carries both defects, and 58.0.5's
+      # RuntimeScheduler.h is byte identical to 57.1.1's. Lowering the language mode
+      # is not an option either, because the package uses `sending` and
+      # `isolated(any)` throughout, and SWIFT_STRICT_CONCURRENCY is ignored once the
+      # language mode is 6.
+      #
+      # Both patches are semantics preserving. Swift only ever calls these as
+      # initializers, so a constructor's return annotation is never read, and the
+      # SWIFT_SHARED_REFERENCE that tells ARC to call retainRuntimeScheduler and
+      # releaseRuntimeScheduler is asserted to have survived. The boxed pointers are
+      # read only inside the synchronous call that received them, which is the same
+      # guarantee the package already relies on for NonisolatedUnsafeVar.
+      #
+      # Every rule asserts how many times its text must occur, so a future package
+      # update fails the build instead of quietly patching nothing.
       - name: Patch expo-modules-jsi for Xcode 26
         run: |
           set -euo pipefail
-          H="node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI-Cxx/include/RuntimeScheduler.h"
+          HDR="node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI-Cxx/include/RuntimeScheduler.h"
 
-          if [ ! -f "$H" ]; then
-            echo "::error::$H is missing, so this patch cannot be applied"
+          if [ ! -f "$HDR" ]; then
+            echo "::error::$HDR is missing, so this patch cannot be applied"
             exit 1
           fi
 
-          N=$(grep -c 'SWIFT_RETURNS_RETAINED RuntimeScheduler' "$H" || true)
+          N=$(grep -c 'SWIFT_RETURNS_RETAINED RuntimeScheduler' "$HDR" || true)
           N=${N:-0}
           if [ "$N" -ne 2 ]; then
-            echo "::error::expected 2 annotated constructors in $H, found $N"
+            echo "::error::expected 2 annotated constructors in $HDR, found $N"
             echo "::error::If expo-modules-jsi now builds cleanly on Xcode 26, delete this step."
             exit 1
           fi
@@ -159,18 +181,76 @@ jobs:
           # Written to a temporary file and moved into place rather than with
           # sed -i, because BSD sed and GNU sed disagree about what -i consumes
           # and a wrong guess there edits nothing while reporting success.
-          sed -E 's/SWIFT_RETURNS_RETAINED (RuntimeScheduler\()/\1/' "$H" > "$H.tmp"
-          mv "$H.tmp" "$H"
+          sed -E 's/SWIFT_RETURNS_RETAINED (RuntimeScheduler\()/\1/' "$HDR" > "$HDR.tmp"
+          mv "$HDR.tmp" "$HDR"
 
-          if grep -q 'SWIFT_RETURNS_RETAINED' "$H"; then
+          if grep -q 'SWIFT_RETURNS_RETAINED' "$HDR"; then
             echo "::error::the annotation is still present after patching"
             exit 1
           fi
-          if ! grep -q 'SWIFT_SHARED_REFERENCE' "$H"; then
+          if ! grep -q 'SWIFT_SHARED_REFERENCE' "$HDR"; then
             echo "::error::the shared reference annotation was lost, ARC would leak"
             exit 1
           fi
-          echo "removed $N spurious constructor annotations, shared reference kept"
+          echo "patch 1: dropped $N invalid constructor annotations, shared reference kept"
+
+          # Patch 2 is literal replacement, so it runs in Node rather than sed. These
+          # search strings contain parentheses and dots, and escaping them for sed is
+          # the kind of quiet mistake that yields a build compiling the wrong thing.
+          # Node is already on this runner for the build itself.
+          node <<'JS'
+          const fs = require('fs');
+          const path = 'node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI/Runtime/JavaScriptRuntime.swift';
+          if (!fs.existsSync(path)) {
+            console.log('::error::' + path + ' is missing, so this patch cannot be applied');
+            process.exit(1);
+          }
+          let src = fs.readFileSync(path, 'utf8');
+
+          // [search text, required occurrence count, replacement]
+          const rules = [
+            ['nonisolated(unsafe) let thisPtr = thisPtr', 2, 'let thisPtrBox = NonisolatedUnsafeVar(thisPtr)'],
+            ['nonisolated(unsafe) let argumentsPtr = argumentsPtr', 2, 'let argumentsPtrBox = NonisolatedUnsafeVar(argumentsPtr)'],
+            ['nonisolated(unsafe) let resultPtr = resultPtr', 3, 'let resultPtrBox = NonisolatedUnsafeVar(resultPtr)'],
+            ['UnsafeMutablePointer(mutating: thisPtr)', 1, 'UnsafeMutablePointer(mutating: thisPtrBox.value!)'],
+            ['start: argumentsPtr', 2, 'start: argumentsPtrBox.value'],
+            ['JavaScriptUnownedValue(runtime.pointee, thisPtr)', 1, 'JavaScriptUnownedValue(runtime.pointee, thisPtrBox.value!)'],
+            ['writeJSIValue(to: resultPtr)', 3, 'writeJSIValue(to: resultPtrBox.value!)'],
+          ];
+
+          for (const [from, want, to] of rules) {
+            const got = src.split(from).length - 1;
+            if (got !== want) {
+              console.log('::error::expected ' + want + ' occurrence(s) of [' + from + '], found ' + got);
+              console.log('::error::if the package was updated, this patch is stale and must be revisited');
+              process.exit(1);
+            }
+            src = src.split(from).join(to);
+          }
+
+          // A half applied patch is worse than none: a box that is declared but
+          // never unwrapped would silently change behaviour, and a bare capture
+          // left behind would still fail the build with the original diagnostic.
+          const leftovers = src.match(/nonisolated\(unsafe\) let (thisPtr|argumentsPtr|resultPtr)/g);
+          if (leftovers) {
+            console.log('::error::still unpatched captures: ' + leftovers.join(', '));
+            process.exit(1);
+          }
+          const declared = src.match(/let (thisPtrBox|argumentsPtrBox|resultPtrBox) = NonisolatedUnsafeVar/g) || [];
+          if (declared.length !== 7) {
+            console.log('::error::expected 7 boxed pointers, found ' + declared.length);
+            process.exit(1);
+          }
+          for (const name of ['thisPtrBox', 'argumentsPtrBox', 'resultPtrBox']) {
+            if (src.split(name + '.value').length - 1 === 0) {
+              console.log('::error::' + name + ' is declared but never read');
+              process.exit(1);
+            }
+          }
+
+          fs.writeFileSync(path, src);
+          console.log('patch 2: boxed 7 call scoped pointers, no bare captures left');
+          JS
 
       # ios/ is gitignored, so the Xcode project is generated fresh every run.
       # --clean guarantees the signing settings are never inherited from a
